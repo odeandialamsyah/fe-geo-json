@@ -108,7 +108,7 @@
 
     <script>
       // API base URL (backend)
-      const API_BASE = "https://be-geojson-production.up.railway.app/api";
+      const API_BASE = "http://127.0.0.1:8080/api";
 
       // Inisialisasi peta
       var map = L.map("map").setView([-6.9175, 107.6191], 13);
@@ -148,7 +148,16 @@
                 ? m.location.coordinates
                 : null;
             if (coords && coords.length === 2) {
-              addMarker(coords[1], coords[0], m.name, false);
+              const dbid = m.id
+                ? typeof m.id === "string"
+                  ? m.id
+                  : m.id.$oid || m.id
+                : m._id
+                ? typeof m._id === "string"
+                  ? m._id
+                  : m._id.$oid || m._id
+                : null;
+              addMarker(coords[1], coords[0], m.name, false, dbid);
             }
           });
           markerCount = markers.length;
@@ -164,11 +173,94 @@
           if (!res.ok) throw new Error("Failed to fetch areas");
           const areas = await res.json();
           areas.forEach((a) => {
-            if (a.coordinates && a.coordinates.length) {
-              // a.coordinates is expected as [ [ [lng,lat], ... ] ]
-              const rings = a.coordinates[0];
+            // a.coordinates is a GeoJSONPolygon object with { type, coordinates: [ [ [lng,lat], ... ] ] }
+            if (
+              a.coordinates &&
+              a.coordinates.coordinates &&
+              a.coordinates.coordinates.length
+            ) {
+              const rings = a.coordinates.coordinates[0];
               const pts = rings.map((p) => [p[1], p[0]]); // convert to [lat,lng]
-              L.polygon(pts, { color: "green", fillOpacity: 0.3 }).addTo(map);
+              const poly = L.polygon(pts, {
+                color: "green",
+                fillOpacity: 0.3,
+              }).addTo(map);
+              // attach db id and name
+              poly._dbid = a.id
+                ? typeof a.id === "string"
+                  ? a.id
+                  : a.id.$oid || a.id
+                : a._id
+                ? typeof a._id === "string"
+                  ? a._id
+                  : a._id.$oid || a._id
+                : null;
+              poly._name = a.name || "Area";
+              const editId =
+                "area_edit_" + Math.random().toString(36).slice(2, 9);
+              const delId =
+                "area_del_" + Math.random().toString(36).slice(2, 9);
+              poly.bindPopup(
+                `<b>${poly._name}</b><br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`
+              );
+              poly.on("popupopen", function (e) {
+                const editBtn = document.getElementById(editId);
+                const delBtn = document.getElementById(delId);
+                if (editBtn) {
+                  editBtn.onclick = async function () {
+                    const newName = prompt("Ubah nama area:", poly._name);
+                    if (!newName) return;
+                    // prepare coordinates in [ [ [lng,lat], ... ] ] format
+                    const latlngs = poly
+                      .getLatLngs()[0]
+                      .map((p) => [p.lng, p.lat]);
+                    // ensure closed
+                    if (
+                      latlngs.length &&
+                      (latlngs[0][0] !== latlngs[latlngs.length - 1][0] ||
+                        latlngs[0][1] !== latlngs[latlngs.length - 1][1])
+                    )
+                      latlngs.push([latlngs[0][0], latlngs[0][1]]);
+                    const payload = {
+                      name: newName,
+                      coordinates: { type: "Polygon", coordinates: [latlngs] },
+                    };
+                    if (!poly._dbid) {
+                      alert("Area belum disimpan ke server");
+                      return;
+                    }
+                    const updated = await updateAreaRequest(
+                      poly._dbid,
+                      payload
+                    );
+                    if (updated) {
+                      poly._name = newName;
+                      poly.setPopupContent(
+                        `<b>${poly._name}</b><br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`
+                      );
+                    }
+                  };
+                }
+                if (delBtn) {
+                  delBtn.onclick = async function () {
+                    if (!confirm("Hapus area ini?")) return;
+                    if (!poly._dbid) {
+                      poly.remove();
+                      areaCount = Math.max(0, areaCount - 1);
+                      document.getElementById("areaCount").textContent =
+                        areaCount;
+                      return;
+                    }
+                    const ok = await deleteAreaRequest(poly._dbid);
+                    if (ok) {
+                      poly.remove();
+                      areaCount = Math.max(0, areaCount - 1);
+                      document.getElementById("areaCount").textContent =
+                        areaCount;
+                    }
+                  };
+                }
+              });
             }
           });
           areaCount = areas.length;
@@ -195,6 +287,35 @@
         } catch (err) {
           console.warn("postMarker error", err);
           return null;
+        }
+      }
+
+      async function updateMarkerRequest(id, payload) {
+        try {
+          const res = await fetch(`${API_BASE}/markers/${id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) throw new Error("Failed to update marker");
+          return await res.json();
+        } catch (err) {
+          console.warn("updateMarker error", err);
+          return null;
+        }
+      }
+
+      async function deleteMarkerRequest(id) {
+        try {
+          const res = await fetch(`${API_BASE}/markers/${id}`, {
+            method: "DELETE",
+          });
+          if (!res.ok && res.status !== 204)
+            throw new Error("Failed to delete marker");
+          return true;
+        } catch (err) {
+          console.warn("deleteMarker error", err);
+          return false;
         }
       }
 
@@ -228,12 +349,58 @@
         }
       }
 
+      // Area update/delete helpers
+      async function updateAreaRequest(id, payload) {
+        try {
+          const res = await fetch(`${API_BASE}/areas/${id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) throw new Error("Failed to update area");
+          return await res.json();
+        } catch (err) {
+          console.warn("updateArea error", err);
+          return null;
+        }
+      }
+
+      async function deleteAreaRequest(id) {
+        try {
+          const res = await fetch(`${API_BASE}/areas/${id}`, {
+            method: "DELETE",
+          });
+          if (!res.ok && res.status !== 204)
+            throw new Error("Failed to delete area");
+          return true;
+        } catch (err) {
+          console.warn("deleteArea error", err);
+          return false;
+        }
+      }
+
       // === Fungsi tambah marker (lokal + optional POST) ===
-      function addMarker(lat, lng, name = "Marker Baru", doPost = true) {
+      function addMarker(
+        lat,
+        lng,
+        name = "Marker Baru",
+        doPost = true,
+        dbid = null
+      ) {
+        const editId = "edit_" + Math.random().toString(36).slice(2, 9);
+        const delId = "del_" + Math.random().toString(36).slice(2, 9);
+
+        var popupHtml = `<b>${name}</b><br>${lat.toFixed(5)}, ${lng.toFixed(
+          5
+        )}<br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`;
+
         var marker = L.marker([lat, lng], { draggable: true })
           .addTo(map)
-          .bindPopup(`<b>${name}</b><br>${lat.toFixed(5)}, ${lng.toFixed(5)}`)
+          .bindPopup(popupHtml)
           .openPopup();
+
+        // attach db id if provided
+        if (dbid) marker._dbid = dbid;
 
         marker.on("dragend", function (e) {
           var pos = e.target.getLatLng();
@@ -241,6 +408,73 @@
           marker.bindPopup(
             `<b>${name}</b><br>${pos.lat.toFixed(5)}, ${pos.lng.toFixed(5)}`
           );
+
+          // if marker exists in DB, update coordinates
+          if (marker._dbid) {
+            const payload = {
+              name: name,
+              location: { type: "Point", coordinates: [pos.lng, pos.lat] },
+            };
+            updateMarkerRequest(marker._dbid, payload).catch(() => {});
+          }
+        });
+
+        marker.on("popupopen", function () {
+          const editBtn = document.getElementById(editId);
+          const delBtn = document.getElementById(delId);
+          if (editBtn) {
+            editBtn.onclick = async function () {
+              const newName = prompt("Ubah nama marker:", name);
+              if (!newName) return;
+              const pos = marker.getLatLng();
+              if (marker._dbid) {
+                const payload = {
+                  name: newName,
+                  location: { type: "Point", coordinates: [pos.lng, pos.lat] },
+                };
+                const updated = await updateMarkerRequest(
+                  marker._dbid,
+                  payload
+                );
+                if (updated) {
+                  name = newName;
+                  marker.bindPopup(
+                    `<b>${name}</b><br>${pos.lat.toFixed(5)}, ${pos.lng.toFixed(
+                      5
+                    )}`
+                  );
+                  updateInfo(pos.lat, pos.lng, name);
+                }
+              } else {
+                // not yet persisted: just change locally
+                name = newName;
+                marker.bindPopup(
+                  `<b>${name}</b><br>${pos.lat.toFixed(5)}, ${pos.lng.toFixed(
+                    5
+                  )}`
+                );
+              }
+            };
+          }
+          if (delBtn) {
+            delBtn.onclick = async function () {
+              if (!confirm("Hapus marker ini?")) return;
+              if (marker._dbid) {
+                const ok = await deleteMarkerRequest(marker._dbid);
+                if (ok) {
+                  marker.remove();
+                  markerCount = Math.max(0, markerCount - 1);
+                  document.getElementById("markerCount").textContent =
+                    markerCount;
+                }
+              } else {
+                marker.remove();
+                markerCount = Math.max(0, markerCount - 1);
+                document.getElementById("markerCount").textContent =
+                  markerCount;
+              }
+            };
+          }
         });
 
         marker.on("click", function (e) {
@@ -250,6 +484,8 @@
         if (doPost) {
           postMarker(name, lat, lng).then((created) => {
             if (created) {
+              // attach db id if returned
+              if (created.id) marker._dbid = created.id;
               markerCount++;
               document.getElementById("markerCount").textContent = markerCount;
             }
@@ -295,7 +531,7 @@
         .getElementById("finishAreaBtn")
         .addEventListener("click", async function () {
           if (currentPolygonPoints.length > 2) {
-            L.polygon(currentPolygonPoints, {
+            const poly = L.polygon(currentPolygonPoints, {
               color: "green",
               fillOpacity: 0.3,
             }).addTo(map);
@@ -304,11 +540,119 @@
               prompt("Masukkan nama area:", "Area Baru") || "Area Baru";
             const created = await postArea(name, currentPolygonPoints);
             if (created) {
+              // attach db id and name
+              poly._dbid = created.id
+                ? typeof created.id === "string"
+                  ? created.id
+                  : created.id.$oid || created.id
+                : created._id
+                ? typeof created._id === "string"
+                  ? created._id
+                  : created._id.$oid || created._id
+                : null;
+              poly._name = created.name || name;
+              const editId =
+                "area_edit_" + Math.random().toString(36).slice(2, 9);
+              const delId =
+                "area_del_" + Math.random().toString(36).slice(2, 9);
+              poly.bindPopup(
+                `<b>${poly._name}</b><br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`
+              );
+              poly.on("popupopen", function (e) {
+                const editBtn = document.getElementById(editId);
+                const delBtn = document.getElementById(delId);
+                if (editBtn) {
+                  editBtn.onclick = async function () {
+                    const newName = prompt("Ubah nama area:", poly._name);
+                    if (!newName) return;
+                    const latlngs = poly
+                      .getLatLngs()[0]
+                      .map((p) => [p.lng, p.lat]);
+                    if (
+                      latlngs.length &&
+                      (latlngs[0][0] !== latlngs[latlngs.length - 1][0] ||
+                        latlngs[0][1] !== latlngs[latlngs.length - 1][1])
+                    )
+                      latlngs.push([latlngs[0][0], latlngs[0][1]]);
+                    const payload = {
+                      name: newName,
+                      coordinates: { type: "Polygon", coordinates: [latlngs] },
+                    };
+                    if (!poly._dbid) {
+                      alert("Area belum disimpan ke server");
+                      return;
+                    }
+                    const updated = await updateAreaRequest(
+                      poly._dbid,
+                      payload
+                    );
+                    if (updated) {
+                      poly._name = newName;
+                      poly.setPopupContent(
+                        `<b>${poly._name}</b><br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`
+                      );
+                    }
+                  };
+                }
+                if (delBtn) {
+                  delBtn.onclick = async function () {
+                    if (!confirm("Hapus area ini?")) return;
+                    if (!poly._dbid) {
+                      poly.remove();
+                      areaCount = Math.max(0, areaCount - 1);
+                      document.getElementById("areaCount").textContent =
+                        areaCount;
+                      return;
+                    }
+                    const ok = await deleteAreaRequest(poly._dbid);
+                    if (ok) {
+                      poly.remove();
+                      areaCount = Math.max(0, areaCount - 1);
+                      document.getElementById("areaCount").textContent =
+                        areaCount;
+                    }
+                  };
+                }
+              });
               areaCount++;
               document.getElementById("areaCount").textContent = areaCount;
               document.getElementById(
                 "infoBox"
               ).innerHTML = `🟩 Area selesai dibuat!<br>Jumlah titik: ${currentPolygonPoints.length}`;
+            } else {
+              // created failed — keep polygon locally with name but no dbid
+              poly._dbid = null;
+              poly._name = name;
+              const editId =
+                "area_edit_" + Math.random().toString(36).slice(2, 9);
+              const delId =
+                "area_del_" + Math.random().toString(36).slice(2, 9);
+              poly.bindPopup(
+                `<b>${poly._name}</b><br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`
+              );
+              poly.on("popupopen", function (e) {
+                const editBtn = document.getElementById(editId);
+                const delBtn = document.getElementById(delId);
+                if (editBtn)
+                  editBtn.onclick = function () {
+                    const newName = prompt("Ubah nama area:", poly._name);
+                    if (newName) {
+                      poly._name = newName;
+                      poly.setPopupContent(
+                        `<b>${poly._name}</b><br><button id="${editId}" class="px-2 py-1 mt-2 bg-yellow-400 rounded">Edit</button> <button id="${delId}" class="px-2 py-1 mt-2 bg-red-500 text-white rounded">Hapus</button>`
+                      );
+                    }
+                  };
+                if (delBtn)
+                  delBtn.onclick = function () {
+                    if (confirm("Hapus area ini?")) {
+                      poly.remove();
+                      areaCount = Math.max(0, areaCount - 1);
+                      document.getElementById("areaCount").textContent =
+                        areaCount;
+                    }
+                  };
+              });
             }
           } else {
             alert("Minimal 3 titik untuk membentuk area!");
